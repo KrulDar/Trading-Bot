@@ -1,0 +1,159 @@
+import ccxt
+import time
+import os
+import json
+import logging
+import sys
+import numpy as np
+from datetime import datetime
+
+# Ensure output is flushed immediately
+sys.stdout.reconfigure(line_buffering=True)
+
+# Load bot name from command-line argument
+if len(sys.argv) > 1:
+    bot_name = sys.argv[1].strip().lower()
+else:
+    bot_name = "bot_1"
+
+print(f"Selected bot: {bot_name}")
+
+# Load configuration file
+CONFIG_PATH = "/home/ubuntu/Documents/project_trading_bot/config/config.json"
+
+with open(CONFIG_PATH, "r") as config_file:
+    config = json.load(config_file)
+
+if bot_name not in config:
+    print(f"⚠ Error: {bot_name} not found in config.json!")
+    sys.exit(1)
+
+bot_config = config[bot_name]
+
+# Assigning strategy parameters
+SYMBOL = bot_config["symbol"]
+TIMEFRAME = bot_config["timeframe"]
+PAPER_BALANCE = bot_config["paper_balance"]
+POSITION_SIZE = bot_config["position_size"]
+TRADE_INTERVAL = bot_config["trade_interval"]
+RSI_THRESHOLD_BUY = bot_config["strategy"]["rsi_threshold_buy"]
+RSI_THRESHOLD_SELL = bot_config["strategy"]["rsi_threshold_sell"]
+MACD_SIGNAL_CROSSOVER = bot_config["strategy"]["macd_signal_crossover"]
+STOP_LOSS = bot_config["risk_management"]["stop_loss"]
+TAKE_PROFIT = bot_config["risk_management"]["take_profit"]
+
+# Binance API
+binance = ccxt.binance()
+
+# Logging setup
+log_dir = os.path.expanduser("~/Documents/project_trading_bot/log")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"{bot_name}.log")
+logging.basicConfig(
+    filename=log_file,
+    filemode="a",
+    format="%(asctime)s, %(message)s",
+    level=logging.INFO,
+)
+
+def log_message(message):
+    print(f"[{bot_name}] {message}", flush=True)
+    logging.info(f"[{bot_name}] {message}")
+
+def fetch_candles(symbol, timeframe, limit=100):
+    """Fetch historical OHLCV data from Binance."""
+    candles = binance.fetch_ohlcv(symbol, timeframe, limit=limit)
+    close_prices = np.array([candle[4] for candle in candles], dtype=float)
+    return close_prices
+
+def calculate_rsi(prices, period=14):
+    """Calculate RSI using an improved method with EMA for smoothing. Includes input validation."""
+    if not isinstance(prices, np.ndarray):  
+        raise ValueError("Input prices must be a NumPy array.")
+
+    if len(prices) < period + 1:  
+        raise ValueError(f"Not enough price data. Need at least {period + 1} data points.")
+
+    if np.any(np.isnan(prices)):  
+        raise ValueError("Price data contains NaN values.")
+
+    delta = np.diff(prices)
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+
+    alpha = 2 / (period + 1)
+    avg_gain = np.zeros_like(gain)
+    avg_loss = np.zeros_like(loss)
+    
+    avg_gain[0] = gain[:period].mean()
+    avg_loss[0] = loss[:period].mean()
+
+    for i in range(1, len(gain)):
+        avg_gain[i] = (gain[i] * alpha) + (avg_gain[i-1] * (1 - alpha))
+        avg_loss[i] = (loss[i] * alpha) + (avg_loss[i-1] * (1 - alpha))
+
+    avg_loss = np.where(avg_loss == 0, 1e-10, avg_loss)
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    return np.concatenate((np.full(period, np.nan), rsi[period - 1:]))
+
+def ema(values, period):
+    """Calculate Exponential Moving Average (EMA) using NumPy."""
+    alpha = 2 / (period + 1)
+    ema_values = np.zeros_like(values)
+    ema_values[0] = values[0]
+
+    for i in range(1, len(values)):
+        ema_values[i] = (values[i] - ema_values[i-1]) * alpha + ema_values[i-1]
+    
+    return ema_values
+
+def calculate_macd(prices, fast_period=12, slow_period=26, signal_period=9):
+    """Calculate MACD and Signal Line using optimized EMA calculation."""
+    fast_ema = ema(prices, fast_period)
+    slow_ema = ema(prices, slow_period)
+    macd = fast_ema - slow_ema
+    signal = ema(macd, signal_period)
+    
+    return macd, signal
+
+def execute_trade():
+    global PAPER_BALANCE
+    position_open = False
+    entry_price = 0.0
+    
+    log_message(f"🚀 {bot_name} started | Balance: {PAPER_BALANCE:.2f} USDT | Pair: {SYMBOL} | Timeframe: {TIMEFRAME}")
+    
+    while True:
+        close_prices = fetch_candles(SYMBOL, TIMEFRAME)
+        current_price = close_prices[-1]
+
+        rsi = calculate_rsi(close_prices)
+        macd, macd_signal = calculate_macd(close_prices)
+
+        latest_rsi = rsi[-1]
+        latest_macd = macd[-1]
+        latest_macd_signal = macd_signal[-1]
+
+        if not position_open:
+            if latest_rsi < RSI_THRESHOLD_BUY and (not MACD_SIGNAL_CROSSOVER or latest_macd > latest_macd_signal):
+                entry_price = current_price
+                position_open = True
+                log_message(f"🟢 BUY at {entry_price:.5f}")
+        else:
+            take_profit_price = entry_price * (1 + TAKE_PROFIT)
+            stop_loss_price = entry_price * (1 - STOP_LOSS)
+            
+            if latest_rsi > RSI_THRESHOLD_SELL or current_price >= take_profit_price or current_price <= stop_loss_price:
+                exit_price = current_price
+                profit = (exit_price - entry_price) * POSITION_SIZE
+                PAPER_BALANCE += profit
+                position_open = False
+                log_message(f"🔴 SELL at {exit_price:.5f} | Profit: {profit:.2f} | New Balance: {PAPER_BALANCE:.2f}")
+        
+        time.sleep(TRADE_INTERVAL)
+
+if __name__ == "__main__":
+    execute_trade()
